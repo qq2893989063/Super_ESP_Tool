@@ -1,0 +1,40 @@
+.pypirc
+*.pyc
+*~
+GPATH
+GRTAGS
+GTAGS
+esptool.egg-info
+.eggs
+build
+dist
+local.mk
+
+.envrc
+report.xml
+
+docs/_build/
+
+# ===== added by ESP Flasher (Super_ESP_Tool) =====
+# bundled compile toolchain: ~2.3 GB (Arduino CLI + esp32 core 3.0.7 + RISC-V GCC)
+toolchain/
+
+# python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# local backups / temp files
+*.bak
+*.tmp
+
+# build & flash outputs produced by the tool
+build_out/
+factory.bin
+flash_dump.bin
+
+# upstream esptool CI configs: not used by this repo
+# (also avoids needing the GitHub workflow token scope)
+.github/workflows/
+.gitlab/
+.gitlab-ci.yml

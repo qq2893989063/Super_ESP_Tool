@@ -1,0 +1,12 @@
+# ESP 烧录器（图形界面）运行依赖
+#
+# esptool 本体的依赖（若使用本目录下的 esptool 源码，这些依赖仍需安装）：
+pyserial>=3.3
+rich_click<2
+click<9
+bitstring>=3.1.6,!=4.2.0
+cryptography>=43.0.0
+reedsolo>=1.5.3,<1.8
+PyYAML>=5.1
+intelhex
+esp-pylib[ide,serial,cli]>=1.0.0
