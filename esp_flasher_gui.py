@@ -30,6 +30,7 @@ ESP 烧录器（图形界面）
 
 from __future__ import annotations
 
+import codecs
 import datetime
 import os
 import queue
@@ -340,6 +341,17 @@ class EspFlasherApp(tk.Tk):
         self.auto_refresh = tk.BooleanVar(value=True)
         self.device_rows: list[tuple[str, str]] = []
 
+        # 串口收发（终端）状态
+        self.serial_port = None                 # pyserial 对象；演示模式为字符串 "demo"
+        self.serial_thread: threading.Thread | None = None
+        self.serial_stop: threading.Event | None = None
+        self.serial_lock = threading.Lock()
+        self.serial_decoder = None
+        self.serial_history: list[str] = []
+        self.serial_history_idx = 0
+        self.hex_buffer = b""
+        self.hex_flush_job = None
+
         self._setup_fonts()
         self._setup_style()
 
@@ -468,22 +480,47 @@ class EspFlasherApp(tk.Tk):
         outer.add(left, weight=1)
         outer.add(right, weight=2)
 
-        self._build_port_panel(left)
+        # 左栏上下分栏：上面是串口列表，下面是串口收发终端
+        self.left_panes = ttk.Panedwindow(left, orient="vertical")
+        self.left_panes.pack(fill="both", expand=True)
+        port_frame = ttk.Frame(self.left_panes)
+        term_frame = ttk.Frame(self.left_panes)
+        self.term_frame = term_frame
+        self.left_panes.add(port_frame, weight=3)
+        self.left_panes.add(term_frame, weight=2)
+
+        self._build_port_panel(port_frame)
+        self._build_terminal_panel(term_frame)
         self._build_tabs(right)
         self.after(200, self._fit_window)
+        self.after(600, self._set_left_sash)
+
+    def _set_left_sash(self) -> None:
+        """左栏“串口列表 / 串口收发”分界线：优先保证收发面板完整可见。"""
+        try:
+            self.update_idletasks()
+            total = self.left_panes.winfo_height()
+            if total <= self.px(120):
+                return
+            want_term = self.term_frame.winfo_reqheight() + self.px(16)
+            pos = max(self.px(120), min(total - want_term, int(total * 0.72)))
+            self.left_panes.sashpos(0, pos)
+        except (tk.TclError, AttributeError):
+            pass
 
     def _fit_window(self) -> None:
         """根据 DPI 与实际内容请求尺寸，确定窗口大小与左右分栏位置。
 
-        高度按**所有标签页里最高的那个**算，否则切到内容高的页面（如“库管理”）
-        时，底部控件会被挤扁。
+        高度取“所有标签页里最高的那个 + 窗口装饰”与“整个窗口的自然请求高度”
+        （含左栏串口收发面板）的较大值，否则内容会被挤扁。
         """
         self.update_idletasks()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         notebook_h = self.notebook.winfo_height()
         chrome = (self.winfo_height() - notebook_h) if notebook_h > 1 else self.px(380)
         tabs = [self.tab_info, self.tab_flash, self.tab_compile, self.tab_lib, self.tab_tools]
-        need_h = max((t.winfo_reqheight() for t in tabs), default=self.px(600)) + chrome
+        need_h = max(max((t.winfo_reqheight() for t in tabs), default=self.px(600)) + chrome,
+                     self.winfo_reqheight())
         w = min(max(self.winfo_reqwidth(), self.px(1120)), sw - self.px(40))
         h = min(max(need_h, self.px(700)), sh - self.px(40))
         w, h = max(w, self.px(900)), max(h, self.px(600))
@@ -491,6 +528,7 @@ class EspFlasherApp(tk.Tk):
         self.minsize(min(self.px(960), w), min(self.px(620), h))
         self.update_idletasks()
         self._set_sash(min(self.px(560), int(w * 0.42)))
+        self._set_left_sash()
 
     def _set_sash(self, pos: int) -> None:
         try:
@@ -546,7 +584,7 @@ class EspFlasherApp(tk.Tk):
 
         cols = ("port", "chip", "status", "desc")
         self.tree_ports = ttk.Treeview(box, columns=cols, show="headings", selectmode="browse",
-                                       height=12)
+                                       height=8)
         headings = {"port": ("端口", 66, "w"), "chip": ("芯片型号", 96, "w"),
                     "status": ("状态", 145, "w"), "desc": ("描述", 190, "w")}
         for key, (text, width, anchor) in headings.items():
@@ -573,6 +611,291 @@ class EspFlasherApp(tk.Tk):
         ttk.Checkbutton(bottom, text="自动刷新", variable=self.auto_refresh).pack(side="left")
         ttk.Button(bottom, text="端口诊断", command=self._start_port_diag).pack(side="left", padx=8)
         ttk.Label(bottom, text="（双击端口可直接连接）", style="Muted.TLabel").pack(side="left", padx=8)
+
+    # ------------------------------------------------------- 串口收发（终端）
+    def _build_terminal_panel(self, parent) -> None:
+        box = ttk.Labelframe(parent, text=" 串口收发 ", padding=6)
+        box.pack(fill="both", expand=True, padx=(0, 4), pady=(6, 0))
+
+        row1 = ttk.Frame(box)
+        row1.pack(fill="x")
+        ttk.Label(row1, text="端口:").pack(side="left")
+        self.var_term_port = tk.StringVar()
+        # 可编辑：除 COMx 外还支持 pyserial URL（loop:// / socket://host:port / rfc2217://host:port）
+        self.cmb_term_port = ttk.Combobox(row1, textvariable=self.var_term_port,
+                                          width=11)
+        self.cmb_term_port.pack(side="left", padx=(2, 6))
+        ttk.Label(row1, text="波特率:").pack(side="left")
+        self.var_term_baud = tk.StringVar(value="115200")
+        ttk.Combobox(row1, textvariable=self.var_term_baud, width=8, state="readonly",
+                     values=["9600", "19200", "38400", "57600", "115200", "230400",
+                             "460800", "921600", "1500000"]).pack(side="left", padx=2)
+        self.btn_term_open = ttk.Button(row1, text="打开串口", style="Accent.TButton",
+                                        command=self._toggle_terminal)
+        self.btn_term_open.pack(side="right")
+
+        row2 = ttk.Frame(box)
+        row2.pack(fill="x", pady=(4, 2))
+        self.var_term_ts = tk.BooleanVar(value=True)
+        self.var_term_hex_view = tk.BooleanVar(value=False)
+        self.var_term_autoscroll = tk.BooleanVar(value=True)
+        self.var_term_eol = tk.StringVar(value="CRLF")
+        ttk.Checkbutton(row2, text="时间戳", variable=self.var_term_ts).pack(side="left")
+        ttk.Checkbutton(row2, text="HEX 显示", variable=self.var_term_hex_view).pack(side="left", padx=4)
+        ttk.Checkbutton(row2, text="自动滚动", variable=self.var_term_autoscroll).pack(side="left", padx=4)
+        ttk.Button(row2, text="清空", width=5, command=self._clear_terminal).pack(side="right")
+        ttk.Button(row2, text="复制", width=5, command=self._copy_terminal).pack(side="right", padx=4)
+
+        body = ttk.Frame(box)
+        body.pack(fill="both", expand=True)
+        self.txt_term = tk.Text(body, height=8, wrap="char", font=self.font_mono,
+                                bg="#101216", fg="#c8e1c0", relief="flat", borderwidth=0,
+                                state="disabled")
+        vs = ttk.Scrollbar(body, orient="vertical", command=self.txt_term.yview)
+        self.txt_term.configure(yscrollcommand=vs.set)
+        self.txt_term.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+        self.txt_term.tag_configure("rx", foreground="#c8e1c0")
+        self.txt_term.tag_configure("ok", foreground="#7ee787")
+        self.txt_term.tag_configure("err", foreground="#ff7b72")
+        self.txt_term.tag_configure("note", foreground="#8b949e")
+        self.txt_term.tag_configure("time", foreground="#6e7681")
+
+        row3 = ttk.Frame(box)
+        row3.pack(fill="x", pady=(4, 0))
+        self.var_term_send = tk.StringVar()
+        self.entry_term_send = ttk.Entry(row3, textvariable=self.var_term_send)
+        self.entry_term_send.pack(side="left", fill="x", expand=True)
+        self.entry_term_send.bind("<Return>", lambda _e: self._send_serial())
+        self.entry_term_send.bind("<Up>", self._term_history_prev)
+        self.entry_term_send.bind("<Down>", self._term_history_next)
+        ttk.Button(row3, text="发送", command=self._send_serial).pack(side="left", padx=(4, 0))
+
+        row4 = ttk.Frame(box)
+        row4.pack(fill="x", pady=(4, 0))
+        self.var_term_hex_send = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row4, text="HEX 发送", variable=self.var_term_hex_send).pack(side="left")
+        ttk.Label(row4, text="换行:").pack(side="left", padx=(10, 2))
+        ttk.Combobox(row4, textvariable=self.var_term_eol, width=6, state="readonly",
+                     values=["无", "LF", "CR", "CRLF"]).pack(side="left")
+        ttk.Label(row4, text="回车发送；↑↓ 翻历史", style="Muted.TLabel").pack(side="left", padx=8)
+
+    # ------------------------------------------------- 串口收发：打开/关闭/收发
+    def _term_is_open(self) -> bool:
+        return self.serial_port is not None
+
+    def _toggle_terminal(self) -> None:
+        if self._term_is_open():
+            self._close_terminal()
+        else:
+            self._open_terminal()
+
+    def _open_terminal(self) -> None:
+        if DEMO_MODE:
+            self.serial_port = "demo"
+            self.serial_stop = threading.Event()
+            self.btn_term_open.configure(text="关闭串口")
+            self._term_write("演示模式：串口收发已打开（发送的内容会原样回显）\n", "ok")
+            return
+        if ESPTOOL_IMPORT_ERROR is not None:
+            messagebox.showerror(APP_NAME, f"pyserial 不可用：\n{ESPTOOL_IMPORT_ERROR}")
+            return
+        port = (self.var_term_port.get() or "").strip() or (self._selected_port() or "")
+        if not port:
+            messagebox.showwarning(APP_NAME, "请先选择要收发的串口。")
+            return
+        self.var_term_port.set(port)
+        if self.esp is not None:
+            self._disconnect_silent()
+            self._log("warn", "已断开设备连接以释放串口（串口收发需要独占串口）")
+        try:
+            baud = int(self.var_term_baud.get())
+        except ValueError:
+            baud = 115200
+        try:
+            if "://" in port:
+                # pyserial URL：loop:// / socket://host:port / rfc2217://host:port
+                sp = serial.serial_for_url(port, baudrate=baud, timeout=0.05,
+                                           write_timeout=1)
+            else:
+                sp = serial.Serial(port=port, baudrate=baud, timeout=0.05, write_timeout=1)
+        except Exception as exc:
+            self._term_write(f"打开 {port} 失败：{friendly_port_error(exc)}（{exc}）\n", "err")
+            return
+        self.serial_port = sp
+        self.serial_stop = threading.Event()
+        self.serial_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self.serial_thread = threading.Thread(
+            target=self._serial_reader, args=(sp, self.serial_stop),
+            daemon=True, name="serial-rx")
+        self.serial_thread.start()
+        self.btn_term_open.configure(text="关闭串口")
+        self._term_write(f"已打开 {port} @ {baud} bps\n", "ok")
+
+    def _close_terminal(self, reason: str = "") -> None:
+        sp, self.serial_port = self.serial_port, None
+        if sp is None:
+            return
+        try:
+            if self.serial_stop is not None:
+                self.serial_stop.set()
+        except Exception:
+            pass
+        try:
+            if sp != "demo":
+                sp.close()
+        except Exception:
+            pass
+        self.serial_thread = None
+        try:
+            self.btn_term_open.configure(text="打开串口")
+        except tk.TclError:
+            pass
+        suffix = f"（{reason}）" if reason else ""
+        self._term_write(f"已关闭串口{suffix}\n", "note")
+
+    def _release_terminal(self, why: str) -> None:
+        """设备操作需要独占串口时，先关掉串口收发。"""
+        if self._term_is_open():
+            self._close_terminal(reason=why)
+            self._log("info", f"已关闭串口收发以释放串口（{why}）")
+
+    def _serial_reader(self, sp, stop) -> None:
+        """后台读取线程：只往队列里塞事件，不碰界面控件。"""
+        while not stop.is_set():
+            try:
+                waiting = sp.in_waiting
+                data = sp.read(waiting if waiting else 1)
+            except Exception as exc:
+                if not stop.is_set():
+                    self._emit("serial_state", state="error",
+                               message=f"串口读取中断：{exc}")
+                return
+            if data:
+                self._emit("serial_rx", data=bytes(data))
+
+    def _send_serial(self) -> None:
+        text = self.var_term_send.get()
+        if not self._term_is_open():
+            self._term_write("串口未打开，请先点“打开串口”\n", "warn")
+            return
+        if not text and self.var_term_hex_send.get():
+            return
+        try:
+            if self.var_term_hex_send.get():
+                payload = bytes.fromhex(re.sub(r"[,\s]+", "", text))
+            else:
+                eol = {"无": b"", "LF": b"\n", "CR": b"\r", "CRLF": b"\r\n"}.get(
+                    self.var_term_eol.get(), b"\r\n")
+                payload = text.encode("utf-8") + eol
+        except ValueError as exc:
+            self._term_write(f"HEX 内容无效：{exc}\n", "err")
+            return
+        if not payload:
+            return
+        if self.serial_port == "demo":
+            self._term_write(f"→ {text}\n", "note")
+            self._emit("serial_rx", data=payload)          # 演示模式回显
+            self._remember_send(text)
+            return
+        try:
+            with self.serial_lock:
+                self.serial_port.write(payload)
+        except Exception as exc:
+            self._term_write(f"发送失败：{exc}\n", "err")
+            return
+        self._term_write(f"→ {text}\n", "note")
+        self._remember_send(text)
+
+    def _remember_send(self, text: str) -> None:
+        if text and (not self.serial_history or self.serial_history[-1] != text):
+            self.serial_history.append(text)
+            del self.serial_history[:-50]
+        self.serial_history_idx = len(self.serial_history)
+        self.var_term_send.set("")
+
+    def _term_history_prev(self, _event=None) -> None:
+        if not self.serial_history:
+            return
+        self.serial_history_idx = max(0, self.serial_history_idx - 1)
+        self.var_term_send.set(self.serial_history[self.serial_history_idx])
+        self.entry_term_send.icursor("end")
+
+    def _term_history_next(self, _event=None) -> None:
+        if not self.serial_history:
+            return
+        self.serial_history_idx = min(len(self.serial_history), self.serial_history_idx + 1)
+        self.var_term_send.set("" if self.serial_history_idx >= len(self.serial_history)
+                               else self.serial_history[self.serial_history_idx])
+
+    def _term_write(self, text: str, level: str = "rx") -> None:
+        """往收发窗口写内容（只在界面线程调用）。"""
+        if not text:
+            return
+        term = self.txt_term
+        term.configure(state="normal")
+        try:
+            total = int(term.index("end-1c").split(".")[0])
+            if total > 4000:
+                term.delete("1.0", "1000.0")
+        except (tk.TclError, ValueError):
+            pass
+        term.insert("end", text, level)
+        if self.var_term_autoscroll.get():
+            term.see("end")
+        term.configure(state="disabled")
+
+    def _on_serial_rx(self, data: bytes) -> None:
+        if not data:
+            return
+        if self.var_term_hex_view.get():
+            # HEX 显示：把短时间内到达的字节合并成一行，避免一串数据被拆成好几行
+            self.hex_buffer += data
+            if self.hex_flush_job is not None:
+                try:
+                    self.after_cancel(self.hex_flush_job)
+                except (tk.TclError, ValueError):
+                    pass
+            self.hex_flush_job = self.after(80, self._flush_hex_buffer)
+            return
+        if self.serial_decoder is None:
+            self.serial_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        body = self.serial_decoder.decode(data)
+        if not body:
+            return
+        if self.var_term_ts.get() and self._term_at_line_start():
+            self._term_write(datetime.datetime.now().strftime("[%H:%M:%S] "), "time")
+        self._term_write(body)
+
+    def _flush_hex_buffer(self) -> None:
+        self.hex_flush_job = None
+        if not self.hex_buffer:
+            return
+        text = self.hex_buffer.hex(" ").upper()
+        self.hex_buffer = b""
+        if self.var_term_ts.get():
+            self._term_write(datetime.datetime.now().strftime("[%H:%M:%S] "), "time")
+        self._term_write(text + "\n")
+
+    def _term_at_line_start(self) -> bool:
+        try:
+            last = self.txt_term.get("end-2c", "end-1c")
+            return last in ("", "\n")
+        except tk.TclError:
+            return True
+
+    def _clear_terminal(self) -> None:
+        self.txt_term.configure(state="normal")
+        self.txt_term.delete("1.0", "end")
+        self.txt_term.configure(state="disabled")
+
+    def _copy_terminal(self) -> None:
+        text = self.txt_term.get("1.0", "end-1c")
+        if not text:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self._term_write("（已复制接收内容到剪贴板）\n", "note")
 
     def _build_tabs(self, parent) -> None:
         nb = ttk.Notebook(parent)
@@ -1198,6 +1521,14 @@ class EspFlasherApp(tk.Tk):
             self._apply_lib_search(ev)
         elif kind == "lib_hint":
             self._apply_lib_hint(ev)
+        elif kind == "serial_rx":
+            self._on_serial_rx(ev.get("data") or b"")
+        elif kind == "serial_state":
+            if ev.get("state") == "error":
+                self._term_write(f"{ev.get('message', '串口错误')}\n", "err")
+                if self._term_is_open():
+                    self._close_terminal(reason="串口异常")
+                self._log("err", ev.get("message", "串口错误"))
         elif kind == "progress_reset":
             self.progress.configure(value=0)
 
@@ -1276,6 +1607,12 @@ class EspFlasherApp(tk.Tk):
         self.cmb_port.configure(values=values)
         if self.var_port.get() not in values:
             self.var_port.set(values[0] if values else "")
+        # 串口收发面板的端口下拉框保持同步
+        self.cmb_term_port.configure(values=values)
+        if self.var_term_port.get() not in values:
+            self.var_term_port.set(values[0] if values else "")
+        elif not self.var_term_port.get() and values:
+            self.var_term_port.set(values[0])
         if first_new:
             self._log("ok", f"发现新串口 {first_new}")
         if values:
@@ -1466,6 +1803,7 @@ class EspFlasherApp(tk.Tk):
         self.cmb_port.configure(values=list(self.port_rows.keys()))
 
     def _scan_devices(self, retry: bool = False) -> None:
+        self._release_terminal("扫描设备")
         if ESPTOOL_IMPORT_ERROR is not None:
             messagebox.showerror(APP_NAME, f"esptool 不可用：\n{ESPTOOL_IMPORT_ERROR}")
             return
@@ -1520,6 +1858,7 @@ class EspFlasherApp(tk.Tk):
 
     # ------------------------------------------------------------- 连接设备
     def _connect_device(self) -> None:
+        self._release_terminal("连接设备")
         if ESPTOOL_IMPORT_ERROR is not None:
             messagebox.showerror(APP_NAME, f"esptool 不可用：\n{ESPTOOL_IMPORT_ERROR}")
             return
@@ -1831,6 +2170,7 @@ class EspFlasherApp(tk.Tk):
         return esp
 
     def _start_flash(self) -> None:
+        self._release_terminal("烧录固件")
         if ESPTOOL_IMPORT_ERROR is not None:
             messagebox.showerror(APP_NAME, f"esptool 不可用：\n{ESPTOOL_IMPORT_ERROR}")
             return
@@ -1899,6 +2239,7 @@ class EspFlasherApp(tk.Tk):
 
     # ------------------------------------------------------------- 高级工具
     def _start_erase(self) -> None:
+        self._release_terminal("擦除 Flash")
         if ESPTOOL_IMPORT_ERROR is not None:
             messagebox.showerror(APP_NAME, f"esptool 不可用：\n{ESPTOOL_IMPORT_ERROR}")
             return
@@ -1942,6 +2283,7 @@ class EspFlasherApp(tk.Tk):
             self.var_read_out.set(path)
 
     def _start_read(self) -> None:
+        self._release_terminal("读取 Flash")
         if ESPTOOL_IMPORT_ERROR is not None:
             messagebox.showerror(APP_NAME, f"esptool 不可用：\n{ESPTOOL_IMPORT_ERROR}")
             return
@@ -1989,6 +2331,7 @@ class EspFlasherApp(tk.Tk):
             self._emit("status", text="读取失败", kind="err", detail=str(exc)[:120])
 
     def _start_reset(self) -> None:
+        self._release_terminal("复位设备")
         port = self._selected_port()
         if not port:
             messagebox.showwarning(APP_NAME, "请先选择串口。")
@@ -2011,6 +2354,7 @@ class EspFlasherApp(tk.Tk):
             self._emit("status", text="复位失败", kind="err", detail=str(exc)[:120])
 
     def _start_flash_id(self) -> None:
+        self._release_terminal("读取 Flash ID")
         port = self._selected_port()
         if not port:
             messagebox.showwarning(APP_NAME, "请先选择串口。")
@@ -2032,6 +2376,7 @@ class EspFlasherApp(tk.Tk):
             self._emit_log("err", f"读取 Flash ID 失败: {exc}")
 
     def _start_read_mac(self) -> None:
+        self._release_terminal("读取 MAC")
         port = self._selected_port()
         if not port:
             messagebox.showwarning(APP_NAME, "请先选择串口。")
@@ -2895,6 +3240,10 @@ class EspFlasherApp(tk.Tk):
     def _on_close(self) -> None:
         if self.busy and not messagebox.askokcancel(APP_NAME, "仍有任务在运行，确定要退出吗？"):
             return
+        try:
+            self._close_terminal()
+        except Exception:
+            pass
         try:
             self._disconnect_silent()
         except Exception:

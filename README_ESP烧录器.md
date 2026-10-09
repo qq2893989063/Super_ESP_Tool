@@ -53,6 +53,10 @@
 
 ![高级工具](gui_screenshot_tools.png)
 
+**串口收发**：左侧设备栏下方的串口终端，可收发数据（含时间戳 / HEX）
+
+![串口收发](gui_screenshot_serial.png)
+
 **库管理**：按名称 / ZIP / Git / 本地文件夹安装库，并列出已安装库
 
 ![库管理](gui_screenshot_lib.png)
@@ -74,6 +78,7 @@
 | Flash 信息 | 厂商（JEDEC ID 自动翻译）、器件 ID、容量、电压 |
 | 安全状态 | 安全启动、Flash 加密、安全下载模式（SDM）、USB 模式 |
 | **源码编译** | **把 `.ino` / `.cpp` / `.h` 编译成 `.bin`**：Arduino 工程、ESP-IDF 工程、任意 ELF→BIN，并可用 esptool 合并成 `factory.bin` |
+| **串口收发** | 左侧设备栏下方的串口终端：打开/关闭串口、实时接收、发送（文本或 HEX）、时间戳、HEX 显示、自动滚动、发送历史、复制/清空；支持 `loop://`、`socket://`、`rfc2217://` 等 pyserial URL；与设备操作自动互斥 |
 | **库管理** | **安装指定库**：按名称 / 从 ZIP 文件 / 从 Git 仓库 / 从本地文件夹安装；搜索、列出已安装库、卸载、更新库索引、升级；编译因缺头文件失败时自动跳到本页并填好库名 |
 | **按设备自动匹配** | 连接开发板后自动识别芯片，选好**编译环境**（多套 Arduino 工具链按芯片切换）、**编译方式**、**开发板 FQBN** 与各处芯片型号，并按设备实测值填 Flash 大小 |
 | 固件烧录 | 多文件 + 地址（自动按文件名推荐 bootloader=0x0 / partition-table=0x8000 / app=0x10000）、单个合并镜像 |
@@ -136,6 +141,7 @@ python esp_flasher_gui.py --tab=flash  # 启动即定位到"烧录固件"标签�
    * 若是 `esptool merge_bin` 或 `idf.py` 生成的单个 `factory.bin`，
      选择 **单个合并镜像** 模式，地址填 `0x0` 即可。
 5. 完成后设备默认自动复位；需要单独复位、擦除或备份 Flash 时用 **高级工具** 页。
+6. 想看板子的串口打印、或给板子发指令，用左侧下方的 **串口收发** 面板（见第七章）。
 
 > 首次烧录建议：波特率先用 `115200`，确认稳定后再提高到 `921600` / `1500000`。
 
@@ -279,13 +285,58 @@ esptool.py --chip esp32 elf2image --flash_mode dio --flash_size 4MB app.elf -o a
 
 ---
 
-## 七、安装与管理库（编译缺库时用）
+## 七、串口收发（串口终端）
+
+左侧设备栏**下方**就是串口收发面板，可以直接和板子对话（看串口打印、发 AT 指令等），
+不用再开别的串口助手。
+
+![串口收发](gui_screenshot_serial.png)
+
+### 7.1 怎么用
+
+1. **端口**：默认跟着左侧串口列表走，也可以自己填（`COM3` 这类串口名，或 pyserial URL，见 7.3）；
+   **波特率**单独选，默认 `115200`。
+2. 点 **打开串口**（按钮变成"关闭串口"）后，收到的数据实时显示在下面。可勾选：
+   * **时间戳**：每行前面加 `[时:分:秒]`；
+   * **HEX 显示**：收到的字节按十六进制显示（短时间内到达的字节合并成一行，不会拆散）；
+   * **自动滚动**：始终滚到最新（关掉后可以往上翻）。
+   * **复制** 把接收内容复制到剪贴板，**清空** 清空接收区。
+3. 在输入框里打字，**回车**或点 **发送** 发出：
+   * **换行**：`无 / LF / CR / CRLF`（默认 CRLF，适合 AT 指令）；
+   * **HEX 发送**：勾上后输入形如 `AA 55 01` 的十六进制内容再发送；
+   * **↑ / ↓**：翻发送历史（最多保留 50 条）。
+
+### 7.2 和设备操作互斥（会自动处理）
+
+同一个串口不能被两个程序同时打开，所以：
+
+* 打开串口收发时若设备还连着，会**自动断开设备连接**并在日志里说明；
+* 反过来，点"连接 / 识别""扫描设备""开始烧录""擦除""读取 Flash"等设备操作时，
+  会**自动关闭串口收发**再继续。
+
+两边都会在运行日志里留一行说明，不需要手动来回切。
+
+### 7.3 支持 pyserial URL（远程串口）
+
+端口框可以直接填 URL，交给 pyserial 的 URL 处理器：
+
+| 写法 | 用途 |
+| --- | --- |
+| `loop://` | 本机回环，写进去的内容会原样读回来（自检用它验证收发） |
+| `socket://192.168.1.50:23` | 连 TCP 转串口设备（如串口服务器） |
+| `rfc2217://192.168.1.50:4000` | 连 RFC2217 远程串口（本目录的 `esp_rfc2217_server.py` 可做服务端） |
+
+> 设备识别/烧录走的是 esptool，只支持本机串口；远程串口目前只在串口收发面板里可用。
+
+---
+
+## 八、安装与管理库（编译缺库时用）
 
 第四个标签页 **库管理**，用来安装/卸载 arduino-cli 编译时用到的第三方库。
 
 ![库管理](gui_screenshot_lib.png)
 
-### 7.1 四种安装方式
+### 8.1 四种安装方式
 
 | 方式 | 用法 | 需要联网 |
 | --- | --- | --- |
@@ -306,7 +357,7 @@ esptool.py --chip esp32 elf2image --flash_mode dio --flash_size 4MB app.elf -o a
 > `C:\Users\28939\Documents\Arduino\libraries`），编译时 arduino-cli 自动使用，
 > 因此内置工具链和系统 Arduino IDE 共用同一批库。
 
-### 7.2 编译缺库时的联动
+### 8.2 编译缺库时的联动
 
 编译因为缺头文件失败（`fatal error: xxx.h: No such file or directory`）时，程序会：
 
@@ -316,13 +367,13 @@ esptool.py --chip esp32 elf2image --flash_mode dio --flash_size 4MB app.elf -o a
 
 例如缺 `Adafruit_NeoPixel.h` 时搜索框会自动填上 `Adafruit_NeoPixel`，双击结果即安装。
 
-### 7.3 关于 `--zip-path` 的说明
+### 8.3 关于 `--zip-path` 的说明
 
 arduino-cli 1.5 默认禁用从 ZIP / Git 安装（配置项 `library.enable_unsafe_install`）。
 本程序在需要时会**把当前生效配置导出成一份临时配置**并打开该开关，
 **不会改动你自己的配置文件**；日志里会显示“已为本次安装启用 …（临时配置）”。
 
-### 7.4 命令行等价
+### 8.4 命令行等价
 
 ```bash
 arduino-cli lib list                                  # 已安装库
@@ -337,9 +388,9 @@ arduino-cli lib upgrade                               # 升级全部
 
 ---
 
-## 八、常见问题
+## 九、常见问题
 
-### 8.1 扫描不到任何端口
+### 9.1 扫描不到任何端口
 
 先点界面左下角的 **端口诊断**，它会输出这样的报告：
 
@@ -368,11 +419,11 @@ arduino-cli lib upgrade                               # 升级全部
 > 另：ESP32-S2/S3/C3 等自带 USB 的芯片插上后出现的是“USB 串行设备 (COMx)”（VID 303A:1001），
 > 而外置 CH340/CP210x 转串口板是另一类设备，两者都可能出现，按需要选对应的那个。
 
-### 8.2 其它问题
+### 9.2 其它问题
 
 | 现象 | 处理 |
 | --- | --- |
-| 串口列表为空 | 见上面 8.1 |
+| 串口列表为空 | 见上面 9.1 |
 | 状态显示"串口被占用" | 关闭串口监视器（Arduino IDE、idf.py monitor、串口助手）后重试 |
 | 状态显示"无响应/非 ESP 设备" | 芯片不在下载模式：按住 BOOT 再点一下 RESET（或复位后重试）；也可能是非 ESP 设备 |
 | 连接失败但端口存在 | 尝试把"连接方式"改为 `usb-reset`（原生 USB 芯片 ESP32-S2/S3/C3 等）或 `no-reset` |
@@ -385,7 +436,7 @@ arduino-cli lib upgrade                               # 升级全部
 
 ---
 
-## 九、与 esptool 命令行的对应关系
+## 十、与 esptool 命令行的对应关系
 
 | 界面操作 | 等价的 esptool 命令 |
 | --- | --- |
@@ -397,15 +448,16 @@ arduino-cli lib upgrade                               # 升级全部
 | 擦除整片 Flash | `esptool.py erase-flash` |
 | 读取 Flash | `esptool.py read-flash 0x0 0x100000 dump.bin` |
 | 复位设备 | `esptool.py --after hard-reset ...` |
+| 串口收发 | `python -m serial.tools.miniterm COM3 115200`（本工具内置同等功能，且支持 HEX/时间戳） |
 | 编译固件 | `arduino-cli compile ...` / `idf.py build`（见第六章） |
 | ELF → BIN | `esptool.py elf2image ...` |
 | 合并 BIN | `esptool.py merge_bin ...` |
 
 ---
 
-## 十、自检与测试
+## 十一、自检与测试
 
-### 10.1 无硬件自检（不需要任何硬件）
+### 11.1 无硬件自检（不需要任何硬件）
 
 ```bash
 python gui_selftest.py
@@ -435,11 +487,12 @@ python gui_selftest.py
 [12] 自动匹配 OK: esp32c6→内置工具链, esp32s3→系统 Arduino IDE
 [13] 库目录 OK: C:\Users\28939\Documents\Arduino\libraries
 [14] 库安装/卸载 OK（隔离环境，未改动真实库目录）
+[15] 串口收发 OK: loop:// 回环收发、HEX、历史、关闭与互斥
 
 自检通过 ✔
 ```
 
-### 10.2 编译端到端测试（真实调用 arduino-cli）
+### 11.2 编译端到端测试（真实调用 arduino-cli）
 
 ```bash
 python compile_e2e_test.py                 # 默认 esp32:esp32:esp32（系统工具链）
@@ -462,7 +515,7 @@ factory.bin : 326960 字节，镜像头校验通过
 端到端编译测试通过 ✔
 ```
 
-### 10.3 实机验证记录
+### 11.3 实机验证记录
 
 在 **ESP32-C6**（USB-Serial/JTAG，VID:PID 303A:1001）上验证过：
 
@@ -480,7 +533,7 @@ factory.bin : 326960 字节，镜像头校验通过
 
 ---
 
-## 十一、实现要点
+## 十二、实现要点
 
 * 直接调用 esptool 的 Python API：`detect_chip()` → `run_stub()` → `change_baud()` →
   `attach_flash()` → `write_flash()/verify_flash()/erase_flash()/read_flash()` → `reset_chip()`，
@@ -494,6 +547,9 @@ factory.bin : 326960 字节，镜像头校验通过
   `build.mcu` 与已安装的编译器目录（`esp-rv32` / `xtensa-esp32s3-elf-gcc` …）求交集，
   得出"这个环境实际能编译哪些芯片"；`resolve_toolchain(chip=…)` 据此挑环境。
   芯片名先做归一化（`ESP32-C6` → `esp32c6`），否则会被误判成 `esp32`。
+* 串口收发用独立的 pyserial 连接（不与 esptool 共用）：读取放在后台线程，
+  只往队列投事件，界面按行首插入时间戳、HEX 显示按 80ms 合并成行；
+  与设备操作通过 `_release_terminal()` / 自动断开实现互斥。
 * 库管理走 `arduino-cli lib ...`；从 ZIP/Git 安装时把当前生效配置导出成临时配置并打开
   `library.enable_unsafe_install`（默认关闭），不修改用户自己的配置。
 * 合并镜像的地址来源可靠：优先读 Arduino 核心的 `boards.txt`
@@ -506,7 +562,7 @@ factory.bin : 326960 字节，镜像头校验通过
 
 ---
 
-## 十二、文件清单
+## 十三、文件清单
 
 | 文件 | 说明 |
 | --- | --- |
@@ -515,12 +571,13 @@ factory.bin : 326960 字节，镜像头校验通过
 | `toolchain/` | 内置 ESP32-C6 编译环境（Arduino CLI + 核心 3.0.7 + RISC-V GCC） |
 | `启动ESP烧录器.bat` | Windows 一键启动（含依赖自检） |
 | `requirements-gui.txt` | 运行依赖清单 |
-| `gui_selftest.py` | 无硬件自检脚本（14 项） |
+| `gui_selftest.py` | 无硬件自检脚本（15 项） |
 | `compile_e2e_test.py` | 编译端到端测试（真实调用 arduino-cli） |
 | `gui_screenshot_real.png` | 实机 ESP32-C6 设备信息 |
 | `gui_screenshot_compile.png` | 编译固件页（真实编译过程） |
 | `gui_screenshot_automatch.png` | 按已连接设备自动匹配 |
 | `gui_screenshot_lib.png` | 库管理页 |
+| `gui_screenshot_serial.png` | 串口收发面板 |
 | `gui_screenshot_flash.png` / `gui_screenshot_tools.png` / `gui_screenshot_diag.png` | 烧录页 / 高级工具 / 端口诊断 |
 
 本工具调用的是本目录下的 esptool 源码（`esptool/`，v5.3.1），许可证与 esptool 保持一致

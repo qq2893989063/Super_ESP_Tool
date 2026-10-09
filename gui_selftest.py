@@ -267,6 +267,57 @@ def main() -> int:
     shutil.rmtree(tmp2, ignore_errors=True)
     print("[14] 库安装/卸载 OK（隔离环境，未改动真实库目录）")
 
+    # 15) 串口收发：用 pyserial 的 loop:// 回环，走真实读写路径
+    saved_demo = g.DEMO_MODE
+    g.DEMO_MODE = False                      # 自检整体跑在演示模式，这里临时关掉
+    try:
+        app.var_term_port.set("loop://")
+        app.var_term_baud.set("115200")
+        app.var_term_hex_send.set(False)
+        app.var_term_hex_view.set(False)
+        app._open_terminal()
+        pump(1.0)
+        assert app._term_is_open(), "串口收发没有打开"
+        assert app.btn_term_open.cget("text") == "关闭串口"
+
+        app.var_term_send.set("hello-selftest")
+        app.var_term_eol.set("CRLF")
+        app._send_serial()
+        pump(1.5)
+        text = app.txt_term.get("1.0", "end-1c")
+        assert "→ hello-selftest" in text, f"没有发出：{text!r}"
+        assert text.count("hello-selftest") >= 2, f"没有收到回环数据：{text!r}"
+
+        app._clear_terminal()
+        app.var_term_hex_send.set(True)
+        app.var_term_hex_view.set(True)
+        app.var_term_send.set("AA 55")
+        app._send_serial()
+        pump(1.5)
+        hex_text = app.txt_term.get("1.0", "end-1c").upper()
+        assert "AA 55" in hex_text, f"HEX 收发不对：{hex_text!r}"
+        app.var_term_hex_send.set(False)
+        app.var_term_hex_view.set(False)
+
+        app._term_history_prev()
+        assert app.var_term_send.get() == "AA 55", "发送历史（↑）不可用"
+
+        app._close_terminal()
+        pump(0.3)
+        assert not app._term_is_open(), "串口没有关闭"
+        assert app.btn_term_open.cget("text") == "打开串口"
+
+        # 设备操作需要独占串口：应先自动关闭收发
+        app._open_terminal()
+        pump(0.5)
+        assert app._term_is_open()
+        app._release_terminal("自检")
+        assert not app._term_is_open(), "设备操作前没有释放串口"
+        print("[15] 串口收发 OK: loop:// 回环收发、HEX、历史、关闭与互斥")
+    finally:
+        g.DEMO_MODE = saved_demo
+        app._close_terminal()
+
     shutil.rmtree(tmp, ignore_errors=True)
     app.destroy()
     print("\n自检通过 ✔")
